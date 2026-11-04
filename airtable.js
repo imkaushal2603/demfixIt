@@ -3,6 +3,7 @@ const axios = require('axios');
 
 const CUSTOMERS = 'Customers';
 const JOBS = 'Jobs';
+const TRADESPEOPLE = 'Tradespeople';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -38,6 +39,46 @@ function saveLocal(request, reason) {
   }
 }
 
+async function fetchAll(table) {
+  const out = [];
+  let offset;
+  do {
+    const r = await axios.get(tableUrl(table), {
+      headers: headers(),
+      params: { pageSize: 100, ...(offset ? { offset } : {}) },
+      timeout: 20000,
+    });
+    out.push(...r.data.records);
+    offset = r.data.offset;
+  } while (offset);
+  return out;
+}
+
+let cache = { at: 0, list: [] };
+
+function normalizeTrader(rec) {
+  const f = rec.fields || {};
+  return {
+    id: rec.id,
+    name: f['Name'] ?? '',
+    phone: String(f['Phone'] ?? '').replace(/\D/g, ''),
+    services: (f['Services'] ?? []).map((s) => String(s).toLowerCase()),
+    availability: f['Availability'] ?? 'Unavailable',
+    lat: f['Latitude'] ?? null,
+    lng: f['Longitude'] ?? null,
+    rating: f['Rating'] ?? null,
+    reviewCount: f['Review count'] ?? 0,
+  };
+}
+
+async function getTradespeople() {
+  if (!enabled()) throw new Error('Airtable is not configured');
+  if (Date.now() - cache.at < 60 * 1000 && cache.list.length) return cache.list;
+  const records = await call(() => fetchAll(TRADESPEOPLE));
+  cache = { at: Date.now(), list: records.map(normalizeTrader).filter((t) => t.name) };
+  return cache.list;
+}
+
 async function findCustomer(phone) {
   const r = await axios.get(tableUrl(CUSTOMERS), {
     headers: headers(),
@@ -51,7 +92,7 @@ async function saveRequest(r) {
   if (!enabled()) {
     console.warn('⚠️ Airtable is not configured (AIRTABLE_TOKEN / AIRTABLE_BASE_ID).');
     saveLocal(r, 'airtable not configured');
-    return false;
+    return null;
   }
 
   try {
@@ -69,18 +110,32 @@ async function saveRequest(r) {
         axios.post(
           tableUrl(CUSTOMERS),
           {
-            records: [{ fields: nullify({
-              'Phone': r.customerPhone,
-              'Name': r.customerName,
-              'Last request': r.receivedAt,
-              'Total requests': 1,
-            }) }],
+            records: [{
+              fields: nullify({
+                'Phone': r.customerPhone,
+                'Name': r.customerName,
+                'Last request': r.receivedAt,
+                'Total requests': 1,
+              })
+            }],
             typecast: true,
           },
           { headers: headers(), timeout: 20000 }
         )
       );
       customer = created.data.records[0];
+    }
+
+    const attachments = [];
+    if (r.media && Array.isArray(r.media)) {
+      for (const m of r.media) {
+        if (m.url) {
+          attachments.push({
+            url: m.url,
+            filename: `${r.ref}-${m.type}.${m.mime?.includes('png') ? 'png' : 'jpg'}`
+          });
+        }
+      }
     }
 
     const jobFields = nullify({
@@ -98,7 +153,7 @@ async function saveRequest(r) {
       'Location pin': r.mapLink,
       'Additional info': r.additional_info,
       'Media count': r.mediaCount,
-      'Photo flags': r.photoFlags,
+      'Photos': attachments.length ? attachments : null,
       'Voice transcripts': r.voiceTranscripts,
       'Received at': r.receivedAt,
     });
@@ -107,12 +162,44 @@ async function saveRequest(r) {
       axios.post(tableUrl(JOBS), { records: [{ fields: jobFields }], typecast: true }, { headers: headers(), timeout: 20000 })
     );
 
-    console.log(`📒 Saved to Airtable: ${r.ref} (customer ${customer.id}, job ${job.data.records[0].id})`);
-    return true;
+    const jobId = job.data.records[0].id;
+    console.log(`📒 Saved to Airtable: ${r.ref} (customer ${customer.id}, job ${jobId})`);
+    return { jobId, customerId: customer.id };
   } catch (e) {
     saveLocal(r, JSON.stringify(e.response?.data || e.message));
+    return null;
+  }
+}
+
+async function updateJob(jobId, fields) {
+  if (!enabled() || !jobId) return false;
+
+  const cleanedFields = { ...fields };
+
+  if ('Assigned tradesperson' in cleanedFields) {
+    const val = cleanedFields['Assigned tradesperson'];
+    if (!val) {
+      cleanedFields['Assigned tradesperson'] = null;
+    } else if (typeof val === 'string') {
+      cleanedFields['Assigned tradesperson'] = [val];
+    } else if (typeof val === 'object' && val.id) {
+      cleanedFields['Assigned tradesperson'] = [val.id];
+    } else if (!Array.isArray(val)) {
+      cleanedFields['Assigned tradesperson'] = null;
+    }
+  }
+
+  const payload = nullify(cleanedFields);
+
+  try {
+    await call(() =>
+      axios.patch(`${tableUrl(JOBS)}/${jobId}`, { fields: payload, typecast: true }, { headers: headers(), timeout: 20000 })
+    );
+    return true;
+  } catch (e) {
+    console.error('❌ Could not update the job in Airtable:', JSON.stringify(e.response?.data || e.message));
     return false;
   }
 }
 
-module.exports = { enabled, saveRequest };
+module.exports = { enabled, saveRequest, updateJob, getTradespeople };
