@@ -465,7 +465,6 @@ async function outsideReply(from, s) {
 function buildRequest(from, s, ref) {
   const d = s.d;
   const u = effectiveUrgency(d);
-  const flagged = d.media.filter((m) => m.flags && m.flags.length);
 
   return {
     ref,
@@ -620,15 +619,15 @@ async function sendOffer(job, entry) {
   ].filter((x) => x !== null).join('\n');
 
   let ok = phone
-    ? await sendButtons(phone, text, [
-      { id: `accept:${offer.id}`, title: 'Accept' },
-      { id: `decline:${offer.id}`, title: 'Decline' },
-    ])
+    ? await sendOfferTemplate(phone, t.name, rq.category, job.ref, offer.id)
     : false;
 
-  if (!ok) {
-    console.log(`⚠️ Standard offer failed for ${t.name} (${phone}). Sending approved template fallback...`);
-    ok = await sendOfferTemplate(phone, t.name, rq.category, job.ref, offer.id);
+  if (!ok && phone) {
+    console.log(`⚠️ Template failed for ${t.name} (${phone}). Trying a normal message...`);
+    ok = await sendButtons(phone, text, [
+      { id: `accept:${offer.id}`, title: 'Accept' },
+      { id: `decline:${offer.id}`, title: 'Decline' },
+    ]);
   }
 
   if (!ok) {
@@ -804,7 +803,7 @@ async function sendOfferTemplate(to, traderName, service, jobRef, offerId) {
         type: 'template',
         template: {
           name: 'job_offer_notification',
-          language: { code: 'en_US' },
+          language: { code: 'en' },
           components: [
             {
               type: 'body',
