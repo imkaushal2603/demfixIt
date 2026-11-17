@@ -132,7 +132,7 @@ async function saveRequest(r) {
         if (m.url) {
           attachments.push({
             url: m.url,
-            filename: `${r.ref}-${m.type}.${m.mime?.includes('png') ? 'png' : 'jpg'}`
+            filename: `${r.ref}-${m.type}.${m.type === 'video' ? 'mp4' : m.type === 'audio' ? 'ogg' : m.mime?.includes('png') ? 'png' : 'jpg'}`
           });
         }
       }

@@ -4,8 +4,10 @@ const axios = require('axios');
 const airtable = require('./airtable');
 const path = require('path');
 const fs = require('fs');
+const paypal = require('./paypal');
 const app = express();
 app.use(express.json());
+const payments = new Map();
 
 if (!fs.existsSync('./public/uploads')) {
   fs.mkdirSync('./public/uploads', { recursive: true });
@@ -67,6 +69,18 @@ const titleCase = (s) => {
 };
 
 const clip = (s, n) => (s && s.length > n ? s.slice(0, n - 1) + '…' : s ?? '');
+
+const TERMS = [
+  '📄 *DemFixIt Terms & Conditions*',
+  '',
+  '1. The $1.00 USD confirmation fee secures your booking with the tradesperson.',
+  '2. The fee does not include the cost of the work. The price for the job is agreed directly with the tradesperson before any work starts.',
+  '3. The tradesperson will contact you to confirm the time. Please be available at the agreed time.',
+  '4. If you need to cancel or change the booking, tell the tradesperson and DemFixIt as early as possible.',
+  '5. DemFixIt connects customers with independent tradespeople. The work itself is carried out by the tradesperson.',
+  '',
+  'By paying the invoice you agree to these terms.',
+].join('\n');
 
 const SYSTEM_PROMPT = `You are DemFixIt's friendly WhatsApp assistant. DemFixIt connects homeowners, holiday-home owners and property managers in Barbados with trusted local tradespeople. Your job is to chat with the customer and collect everything needed to create a job request.
 
@@ -185,7 +199,12 @@ async function downloadMedia(mediaId) {
     const file = await axios.get(meta.data.url, { headers: auth, responseType: 'arraybuffer', timeout: 30000 });
 
     const mime = meta.data.mime_type || 'application/octet-stream';
-    const ext = mime.includes('png') ? 'png' : mime.includes('video') ? 'mp4' : 'jpg';
+    const ext = mime.includes('png') ? 'png'
+      : mime.includes('video') ? 'mp4'
+        : mime.includes('ogg') ? 'ogg'
+          : mime.includes('mpeg') ? 'mp3'
+            : mime.startsWith('audio') ? 'm4a'
+              : 'jpg';
     const filename = `${mediaId}-${Date.now()}.${ext}`;
     const filePath = path.join(__dirname, 'public', 'uploads', filename);
 
@@ -208,7 +227,7 @@ async function downloadMedia(mediaId) {
 async function transcribeVoice(mediaId) {
   if (!mediaId || !OPENAI_API_KEY) return null;
   try {
-    const { buffer, mime } = await downloadMedia(mediaId);
+    const { buffer, mime, url } = await downloadMedia(mediaId);
     const ext = mime.includes('mpeg') ? 'mp3' : mime.includes('mp4') || mime.includes('aac') ? 'm4a' : 'ogg';
 
     const form = new FormData();
@@ -224,7 +243,7 @@ async function transcribeVoice(mediaId) {
     const j = await r.json();
     const text = (j.text ?? '').trim();
     console.log('🎙️ Voice note transcript:', text);
-    return text || null;
+    return { text: text || null, url };
   } catch (e) {
     console.error('❌ Transcription failed:', JSON.stringify(e.response?.data || e.message));
     return null;
@@ -322,6 +341,42 @@ async function sendText(to, body) {
     return false;
   } finally {
     stopTyping(to);
+  }
+}
+
+async function sendVideo(to, link, caption) {
+  try {
+    await axios.post(
+      `${GRAPH}/${PHONE_NUMBER_ID}/messages`,
+      { messaging_product: 'whatsapp', to, type: 'video', video: { link, caption } },
+      { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' } }
+    );
+  } catch (e) {
+    console.error('❌ Send error (video) to', to, JSON.stringify(e.response?.data?.error || e.message));
+  }
+}
+
+async function sendAudio(to, link) {
+  try {
+    await axios.post(
+      `${GRAPH}/${PHONE_NUMBER_ID}/messages`,
+      { messaging_product: 'whatsapp', to, type: 'audio', audio: { link } },
+      { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' } }
+    );
+  } catch (e) {
+    console.error('❌ Send error (audio) to', to, JSON.stringify(e.response?.data?.error || e.message));
+  }
+}
+
+async function sendImage(to, link, caption) {
+  try {
+    await axios.post(
+      `${GRAPH}/${PHONE_NUMBER_ID}/messages`,
+      { messaging_product: 'whatsapp', to, type: 'image', image: { link, caption } },
+      { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' } }
+    );
+  } catch (e) {
+    console.error('❌ Send error (image) to', to, JSON.stringify(e.response?.data?.error || e.message));
   }
 }
 
@@ -619,7 +674,7 @@ async function sendOffer(job, entry) {
   ].filter((x) => x !== null).join('\n');
 
   let ok = phone
-    ? await sendOfferTemplate(phone, t.name, rq.category, job.ref, offer.id)
+    ? await sendOfferTemplate(phone, t, rq, job, entry, offer.id)
     : false;
 
   if (!ok && phone) {
@@ -671,14 +726,36 @@ async function handleOfferResponse(from, action, offerId) {
       'Please contact the customer to confirm the time.',
     ].filter((x) => x !== null).join('\n'));
 
-    return sendText(job.customerPhone, [
+    for (const m of rq.media ?? []) {
+      if (!m.url) continue;
+      if (m.type === 'video') await sendVideo(from, m.url, `🎥 ${job.ref}`);
+      else if (m.type === 'audio') await sendAudio(from, m.url);
+      else await sendImage(from, m.url, `📷 ${job.ref}`);
+    }
+    if (rq.voiceTranscripts) await sendText(from, `🎙 Customer voice note (transcript):\n${clip(rq.voiceTranscripts, 900)}`);
+
+    let payLink = null;
+    try {
+      const inv = await paypal.createInvoice({ ref: job.ref, description: `DemFixIt confirmation fee ${job.ref}` });
+      payments.set(inv.id, { ref: job.ref, paid: false, createdAt: Date.now() });
+      payLink = inv.link;
+    } catch (e) {
+      console.error('❌ PayPal create invoice failed:', JSON.stringify(e.response?.data || e.message));
+    }
+
+    await sendText(job.customerPhone, [
       'Good news! 🎉',
       `${t.name} has accepted your job (${job.ref}).`,
       t.rating != null ? `⭐ ${Number(t.rating).toFixed(1)} · ${t.reviewCount} reviews` : null,
       rq.when ? `⏰ Requested time: ${rq.when}` : null,
       '',
+      payLink ? `To confirm your booking, please pay your $1.00 invoice here:\n${payLink}` : null,
+      payLink ? '' : null,
       "They'll be in touch to confirm the details.",
     ].filter((x) => x !== null).join('\n'));
+
+    if (payLink) await sendText(job.customerPhone, TERMS);
+    return;
   }
 
   offer.status = 'declined';
@@ -699,6 +776,29 @@ async function sweepOffers() {
     await sendText(offer.phone, `⌛ The offer for job ${job.ref} has expired because we did not hear back in time.`);
     await sendText(job.customerPhone, `Sorry, ${offer.trader.name} didn't respond in time. 🙏`);
     await presentShortlist(job, 'Here are other options for you:');
+  }
+}
+
+async function sweepPayments() {
+  for (const [id, p] of payments.entries()) {
+    if (p.paid) continue;
+    if (Date.now() - p.createdAt > 48 * 3600 * 1000) { payments.delete(id); continue; }
+    try {
+      const inv = await paypal.getInvoice(id);
+      if (!inv.paid) continue;
+      p.paid = true;
+      const job = jobs.get(p.ref);
+      if (job) {
+        await sendText(job.customerPhone, [
+          '✅ Payment received. Thank you! 🙏',
+          '',
+          `Here is your paid invoice (${p.ref}):`,
+          inv.link,
+        ].join('\n'));
+      }
+    } catch (e) {
+      console.error('❌ PayPal invoice check failed:', JSON.stringify(e.response?.data || e.message));
+    }
   }
 }
 
@@ -793,7 +893,21 @@ async function runTurn(from) {
   await sendText(from, reply);
 }
 
-async function sendOfferTemplate(to, traderName, service, jobRef, offerId) {
+const tv = (s, max = 100) => String(s ?? '').replace(/[\r\n\t]+/g, ' ').replace(/ {2,}/g, ' ').trim().slice(0, max) || '-';
+
+async function sendOfferTemplate(to, t, rq, job, entry, offerId) {
+  const urls = (type) => (rq.media ?? []).filter((m) => m.type === type && m.url).map((m) => m.url);
+  const images = urls('image');
+  const videos = urls('video');
+
+  const parts = [];
+  if (images.length) parts.push(`Photos: ${images.slice(0, 3).join(' , ')}${images.length > 3 ? ` (+${images.length - 3} more after you accept)` : ''}`);
+  if (videos.length) parts.push(`Video: ${videos.slice(0, 2).join(' , ')}${videos.length > 2 ? ` (+${videos.length - 2} more after you accept)` : ''}`);
+  if (rq.voiceTranscripts) parts.push(`Voice note: "${clip(rq.voiceTranscripts.replace(/\s+/g, ' '), 200)}"`);
+  const attach = parts.join(' | ') || 'None';
+
+  const problem = `${rq.description}${rq.additional_info ? ' | Notes: ' + rq.additional_info : ''}`;
+
   try {
     await axios.post(
       `${GRAPH}/${PHONE_NUMBER_ID}/messages`,
@@ -808,23 +922,19 @@ async function sendOfferTemplate(to, traderName, service, jobRef, offerId) {
             {
               type: 'body',
               parameters: [
-                { type: 'text', text: traderName },
-                { type: 'text', text: service },
-                { type: 'text', text: jobRef },
-              ],
+                tv(t.name, 60),
+                tv(job.ref, 40),
+                tv(`${rq.category}${rq.sub_category ? ' - ' + rq.sub_category : ''}`, 100),
+                tv(problem, 400),
+                tv(rq.when ?? 'Flexible', 100),
+                tv(rq.urgency ?? 'Non-emergency', 30),
+                tv(entry.km != null ? entry.km.toFixed(1) : '-', 10),
+                tv(attach, 700),
+                tv(rq.additional_info ?? 'None', 300),
+              ].map((text) => ({ type: 'text', text })),
             },
-            {
-              type: 'button',
-              sub_type: 'quick_reply',
-              index: '0',
-              parameters: [{ type: 'payload', payload: `accept:${offerId}` }],
-            },
-            {
-              type: 'button',
-              sub_type: 'quick_reply',
-              index: '1',
-              parameters: [{ type: 'payload', payload: `decline:${offerId}` }],
-            },
+            { type: 'button', sub_type: 'quick_reply', index: '0', parameters: [{ type: 'payload', payload: `accept:${offerId}` }] },
+            { type: 'button', sub_type: 'quick_reply', index: '1', parameters: [{ type: 'payload', payload: `decline:${offerId}` }] },
           ],
         },
       },
@@ -948,18 +1058,20 @@ async function handleMessage(from, name, msg) {
       break;
     }
 
-    case 'video':
-      s.d.media.push({ type: 'video', id: msg.video?.id, flags: [] });
+    case 'video': {
+      const dl = await downloadMedia(msg.video?.id);
+      s.d.media.push({ type: 'video', id: msg.video?.id, url: dl?.url ?? null, flags: [] });
       s.history.push({ role: 'user', content: `[The customer sent a video${msg.video?.caption ? ' with the caption: ' + msg.video.caption : ''}]` });
       delay = 4000;
       break;
+    }
 
     case 'audio': {
-      s.d.media.push({ type: 'audio', id: msg.audio?.id, flags: [] });
-      const transcript = await transcribeVoice(msg.audio?.id);
-      if (transcript) {
-        s.d.voice_transcripts.push(transcript);
-        s.history.push({ role: 'user', content: `[The customer sent a voice note. Transcript of what they said: "${transcript.slice(0, 1500)}"]` });
+      const tr = await transcribeVoice(msg.audio?.id);
+      s.d.media.push({ type: 'audio', id: msg.audio?.id, url: tr?.url ?? null, flags: [] });
+      if (tr?.text) {
+        s.d.voice_transcripts.push(tr.text);
+        s.history.push({ role: 'user', content: `[The customer sent a voice note. Transcript of what they said: "${tr.text.slice(0, 1500)}"]` });
       } else {
         s.history.push({ role: 'user', content: '[The customer sent a voice note, but it could not be transcribed.]' });
       }
@@ -979,6 +1091,11 @@ async function handleMessage(from, name, msg) {
 }
 
 async function routeMessage(from, name, msg) {
+  if (msg.type === 'button' && msg.button?.payload) {
+    const m = msg.button.payload.match(/^(accept|decline):(.+)$/);
+    if (m) return handleOfferResponse(from, m[1], m[2]);
+  }
+
   if (msg.type === 'interactive' && msg.interactive?.button_reply) {
     const m = msg.interactive.button_reply.id.match(/^(accept|decline):(.+)$/);
     if (m) return handleOfferResponse(from, m[1], m[2]);
@@ -1031,7 +1148,7 @@ app.post('/webhook', (req, res) => {
         seen.add(msg.id);
         if (seen.size > 5000) seen.clear();
 
-        console.log(`📩 ${msg.from} (${msg.type}) ${msg.text?.body ?? msg.interactive?.button_reply?.id ?? ''}`);
+        console.log(`📩 ${msg.from} (${msg.type}) ${msg.text?.body ?? msg.interactive?.button_reply?.id ?? msg.button?.payload ?? ''}`);
         startTyping(msg.from, msg.id);
         enqueue(msg.from, () => routeMessage(msg.from, name, msg)).catch((e) => {
           console.error('❌ Handler error:', e);
@@ -1042,6 +1159,42 @@ app.post('/webhook', (req, res) => {
   }
 });
 
+app.get('/paypal/return', async (req, res) => {
+  const orderId = req.query.token;
+  const p = payments.get(orderId);
+  if (!p) return res.status(404).send('Unknown payment.');
+  try {
+    if (!p.paid) {
+      const cap = await paypal.captureOrder(orderId);
+      if (cap.status === 'COMPLETED') {
+        p.paid = true;
+        const job = jobs.get(p.ref);
+        const c = cap.purchase_units?.[0]?.payments?.captures?.[0];
+        if (job) {
+          const rq = job.request;
+          await sendText(job.customerPhone, [
+            '🧾 *DemFixIt Invoice*',
+            `Invoice no: ${p.ref}`,
+            `Date: ${new Date().toISOString().slice(0, 10)}`,
+            `Service: ${rq.category}${rq.sub_category ? ' → ' + rq.sub_category : ''}`,
+            `Confirmation fee: ${c?.amount?.value ?? '1.00'} ${c?.amount?.currency_code ?? 'USD'}`,
+            `Status: PAID ✅`,
+            `PayPal transaction: ${c?.id ?? '-'}`,
+            '',
+            'Thank you for your payment! 🙏',
+          ].join('\n'));
+        }
+      }
+    }
+    res.send('<h2>✅ Payment received. You can go back to WhatsApp.</h2>');
+  } catch (e) {
+    console.error('❌ PayPal capture failed:', JSON.stringify(e.response?.data || e.message));
+    res.status(500).send('Something went wrong confirming your payment. Please contact support.');
+  }
+});
+
+app.get('/paypal/cancel', (_req, res) => res.send('Payment cancelled. You can go back to WhatsApp.'));
+
 app.get('/health', (_req, res) =>
   res.json({ ok: true, ai: Boolean(OPENAI_API_KEY), model: AI_MODEL, fallback: FALLBACK_MODEL, airtable: airtable.enabled() })
 );
@@ -1051,4 +1204,5 @@ app.listen(PORT, () => {
   if (!OPENAI_API_KEY) console.warn('⚠️ OPENAI_API_KEY not set. The bot cannot reply until you add it to .env.');
   if (!airtable.enabled()) console.warn('⚠️ Airtable not configured. Finished requests go to failed-airtable.jsonl.');
   setInterval(() => sweepOffers().catch((e) => console.error('❌ Sweep error:', e)), 15000);
+  setInterval(() => sweepPayments().catch((e) => console.error('❌ Payment sweep error:', e)), 20000);
 });
