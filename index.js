@@ -25,6 +25,7 @@ const DEV_TRADER_PHONE = (process.env.DEV_TRADER_PHONE || '').replace(/\D/g, '')
 const OFFER_TIMEOUT_SECONDS = Number(process.env.OFFER_TIMEOUT_SECONDS || 300);
 const NEAREST_POOL = 10;
 const SHOW_COUNT = 5;
+const MAX_DISTANCE_KM = Number(process.env.MAX_DISTANCE_KM || 5);
 
 const BARBADOS_CENTRE = { lat: 13.19, lng: -59.54 };
 const BARBADOS_RADIUS_KM = 30;
@@ -564,7 +565,7 @@ function buildShortlist(all, job) {
     }));
 
   if (here) {
-    list = list.filter((x) => x.km != null);
+    list = list.filter((x) => x.km != null && x.km <= MAX_DISTANCE_KM);
     list.sort((a, b) => a.km - b.km);
     list = list.slice(0, NEAREST_POOL);
   }
@@ -897,16 +898,8 @@ const tv = (s, max = 100) => String(s ?? '').replace(/[\r\n\t]+/g, ' ').replace(
 
 async function sendOfferTemplate(to, t, rq, job, entry, offerId) {
   const urls = (type) => (rq.media ?? []).filter((m) => m.type === type && m.url).map((m) => m.url);
-  const images = urls('image');
-  const videos = urls('video');
-
-  const parts = [];
-  if (images.length) parts.push(`Photos: ${images.slice(0, 3).join(' , ')}${images.length > 3 ? ` (+${images.length - 3} more after you accept)` : ''}`);
-  if (videos.length) parts.push(`Video: ${videos.slice(0, 2).join(' , ')}${videos.length > 2 ? ` (+${videos.length - 2} more after you accept)` : ''}`);
-  if (rq.voiceTranscripts) parts.push(`Voice note: "${clip(rq.voiceTranscripts.replace(/\s+/g, ' '), 200)}"`);
-  const attach = parts.join(' | ') || 'None';
-
-  const problem = `${rq.description}${rq.additional_info ? ' | Notes: ' + rq.additional_info : ''}`;
+  const attach = [...urls('image').slice(0, 2), ...urls('video').slice(0, 1), ...urls('audio').slice(0, 1)].join(' ') || 'None';
+  console.log('📎 Customer attachments sent in template:', attach);
 
   try {
     await axios.post(
@@ -925,7 +918,7 @@ async function sendOfferTemplate(to, t, rq, job, entry, offerId) {
                 tv(t.name, 60),
                 tv(job.ref, 40),
                 tv(`${rq.category}${rq.sub_category ? ' - ' + rq.sub_category : ''}`, 100),
-                tv(problem, 400),
+                tv(rq.description, 400),
                 tv(rq.when ?? 'Flexible', 100),
                 tv(rq.urgency ?? 'Non-emergency', 30),
                 tv(entry.km != null ? entry.km.toFixed(1) : '-', 10),

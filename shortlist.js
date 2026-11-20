@@ -3,7 +3,7 @@ const { haversineKm } = require('./geo');
 const CONFIG = {
   nearestPool: Number(process.env.SHORTLIST_NEAREST_POOL || 10),
   showCount: Number(process.env.SHORTLIST_SIZE || 5),
-  defaultRadiusKm: Number(process.env.DEFAULT_SERVICE_RADIUS_KM || 15),
+  defaultRadiusKm: Number(process.env.MAX_DISTANCE_KM || 5),
   requireVerified: process.env.REQUIRE_VERIFIED === 'true',
 };
 
